@@ -1,0 +1,304 @@
+/*
+ * ============================================================
+ *  ORAL CANCER SCREENING DEVICE — HARDWARE FIRMWARE
+ *  ESP32-S3-N16R8 Dev Module | FreeRTOS Dual-Core
+ * ============================================================
+ *
+ *  BOARD SETTINGS (Tools menu):
+ *  - Board:            ESP32S3 Dev Module
+ *  - PSRAM:            OPI PSRAM   <-- CRITICAL for 8MB PSRAM
+ *  - Flash Size:       16MB (128Mb)
+ *  - Partition Scheme: 16MB Flash (3MB APP / 9.9MB FATFS)
+ * ============================================================
+ */
+
+#include "Arduino.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+
+#include "esp_camera.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
+
+// ============================================================
+//  PIN DEFINITIONS (ESP32-S3 Dev Module)
+// ============================================================
+#define LED_405NM_PIN     2     // 405 nm excitation LED via transistor
+#define CAPTURE_BTN_PIN   1     // Capture button (active LOW)
+
+// OLED (I2C)
+#define OLED_SDA          41
+#define OLED_SCL          42
+#define OLED_WIDTH        128
+#define OLED_HEIGHT       64
+#define OLED_ADDR         0x3C
+
+// SD Card SPI pins
+#define SD_CS_PIN         10
+#define SD_MOSI_PIN       11
+#define SD_MISO_PIN       13
+#define SD_CLK_PIN        12
+
+// ============================================================
+//  CAMERA PIN DEFINITIONS (Standard ESP32-S3 CAM Pinout)
+// ============================================================
+#define CAM_PIN_PWDN      -1
+#define CAM_PIN_RESET     -1
+#define CAM_PIN_XCLK      15
+#define CAM_PIN_SIOD      4
+#define CAM_PIN_SIOC      5
+
+#define CAM_PIN_D7        16
+#define CAM_PIN_D6        17
+#define CAM_PIN_D5        18
+#define CAM_PIN_D4        12
+#define CAM_PIN_D3        10
+#define CAM_PIN_D2        8
+#define CAM_PIN_D1        9
+#define CAM_PIN_D0        11
+
+#define CAM_PIN_VSYNC     6
+#define CAM_PIN_HREF      7
+#define CAM_PIN_PCLK      13
+
+// ============================================================
+//  RTOS OBJECTS & SHARED STATE
+// ============================================================
+SemaphoreHandle_t xFrameReadySemaphore;
+SemaphoreHandle_t xFrameMutex;
+QueueHandle_t xStatusQueue;
+
+TaskHandle_t xCameraTaskHandle   = NULL;
+TaskHandle_t xSDWriteTaskHandle  = NULL;
+TaskHandle_t xOLEDTaskHandle     = NULL;
+
+camera_fb_t* sharedFrameBuffer = NULL;
+volatile bool newFramePending   = false;
+volatile uint32_t captureCount  = 0;
+
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+bool oledAvailable = false;
+
+typedef struct {
+  char message[32];
+  bool isError;
+} StatusMsg_t;
+
+// ============================================================
+//  CAMERA INIT
+// ============================================================
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = CAM_PIN_D0;
+  config.pin_d1       = CAM_PIN_D1;
+  config.pin_d2       = CAM_PIN_D2;
+  config.pin_d3       = CAM_PIN_D3;
+  config.pin_d4       = CAM_PIN_D4;
+  config.pin_d5       = CAM_PIN_D5;
+  config.pin_d6       = CAM_PIN_D6;
+  config.pin_d7       = CAM_PIN_D7;
+  config.pin_xclk     = CAM_PIN_XCLK;
+  config.pin_pclk     = CAM_PIN_PCLK;
+  config.pin_vsync    = CAM_PIN_VSYNC;
+  config.pin_href     = CAM_PIN_HREF;
+  config.pin_sccb_sda = CAM_PIN_SIOD;
+  config.pin_sccb_scl = CAM_PIN_SIOC;
+  config.pin_pwdn     = CAM_PIN_PWDN;
+  config.pin_reset    = CAM_PIN_RESET;
+
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_UXGA; // 1600x1200
+    config.jpeg_quality = 10;
+    config.fb_count     = 2;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    Serial.println("[Camera] OPI PSRAM found — using UXGA resolution");
+  } else {
+    config.frame_size   = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    Serial.println("[Camera] WARNING: No PSRAM detected!");
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[Camera] Init FAILED: 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 1);
+  s->set_saturation(s, 0);
+  s->set_contrast(s, 1);
+  s->set_whitebal(s, 0);
+  s->set_exposure_ctrl(s, 0);
+  s->set_aec_value(s, 400);
+  s->set_gain_ctrl(s, 0);
+  s->set_agc_gain(s, 5);
+
+  return true;
+}
+
+// ============================================================
+//  SD CARD INIT
+// ============================================================
+bool initSD() {
+  SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("[SD] Mount FAILED");
+    return false;
+  }
+  if (!SD.exists("/scans")) {
+    SD.mkdir("/scans");
+  }
+  return true;
+}
+
+// ============================================================
+//  FREERTOS TASKS
+// ============================================================
+void vCameraTask(void* pvParameters) {
+  StatusMsg_t msg;
+  bool btnPrevState = HIGH;
+
+  while (1) {
+    bool btnState = digitalRead(CAPTURE_BTN_PIN);
+
+    if (btnState == LOW && btnPrevState == HIGH) {
+      digitalWrite(LED_405NM_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(150));
+
+      camera_fb_t* stale = esp_camera_fb_get();
+      if (stale) esp_camera_fb_return(stale);
+
+      camera_fb_t* fb = esp_camera_fb_get();
+      digitalWrite(LED_405NM_PIN, LOW);
+
+      if (!fb) {
+        snprintf(msg.message, sizeof(msg.message), "Capture FAILED!");
+        msg.isError = true;
+        xQueueSend(xStatusQueue, &msg, 0);
+      } else {
+        if (xSemaphoreTake(xFrameMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+          if (sharedFrameBuffer != NULL) {
+            esp_camera_fb_return(sharedFrameBuffer);
+          }
+          sharedFrameBuffer = fb;
+          captureCount++;
+          xSemaphoreGive(xFrameMutex);
+          xSemaphoreGive(xFrameReadySemaphore);
+
+          snprintf(msg.message, sizeof(msg.message), "Saving #%lu...", captureCount);
+          msg.isError = false;
+          xQueueSend(xStatusQueue, &msg, 0);
+        } else {
+          esp_camera_fb_return(fb);
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    btnPrevState = btnState;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+void vSDWriteTask(void* pvParameters) {
+  StatusMsg_t msg;
+  char filepath[64];
+
+  while (1) {
+    if (xSemaphoreTake(xFrameReadySemaphore, portMAX_DELAY) == pdTRUE) {
+      camera_fb_t* fbToSave = NULL;
+      uint32_t frameNum = 0;
+
+      if (xSemaphoreTake(xFrameMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        fbToSave = sharedFrameBuffer;
+        sharedFrameBuffer = NULL;
+        frameNum = captureCount;
+        xSemaphoreGive(xFrameMutex);
+      }
+
+      if (fbToSave == NULL) continue;
+
+      snprintf(filepath, sizeof(filepath), "/scans/scan_%04lu.jpg", frameNum);
+      File f = SD.open(filepath, FILE_WRITE);
+      if (!f) {
+        snprintf(msg.message, sizeof(msg.message), "SD Write FAIL!");
+        msg.isError = true;
+        xQueueSend(xStatusQueue, &msg, 0);
+      } else {
+        f.write(fbToSave->buf, fbToSave->len);
+        f.close();
+        snprintf(msg.message, sizeof(msg.message), "Saved scan_%04lu", frameNum);
+        msg.isError = false;
+        xQueueSend(xStatusQueue, &msg, 0);
+      }
+
+      Serial.write(fbToSave->buf, fbToSave->len);
+      Serial.println();
+      esp_camera_fb_return(fbToSave);
+    }
+  }
+}
+
+void vOLEDTask(void* pvParameters) {
+  StatusMsg_t msg;
+  while (1) {
+    if (xQueueReceive(xStatusQueue, &msg, pdMS_TO_TICKS(500)) == pdTRUE) {
+      if (oledAvailable) {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.println(msg.isError ? "!! ERROR !!" : "OralScan v1.0");
+        display.println(msg.message);
+        display.printf("Scans: %lu\n", captureCount);
+        display.display();
+      }
+    }
+  }
+}
+
+// ============================================================
+//  SETUP & LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_405NM_PIN, OUTPUT);
+  pinMode(CAPTURE_BTN_PIN, INPUT_PULLUP);
+  digitalWrite(LED_405NM_PIN, LOW);
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    oledAvailable = true;
+  }
+
+  initCamera();
+  initSD();
+
+  xFrameReadySemaphore = xSemaphoreCreateBinary();
+  xFrameMutex          = xSemaphoreCreateMutex();
+  xStatusQueue         = xQueueCreate(5, sizeof(StatusMsg_t));
+
+  xTaskCreatePinnedToCore(vCameraTask,  "CameraTask",  8192, NULL, 3, &xCameraTaskHandle,  0);
+  xTaskCreatePinnedToCore(vSDWriteTask, "SDWriteTask", 8192, NULL, 3, &xSDWriteTaskHandle, 1);
+  xTaskCreatePinnedToCore(vOLEDTask,    "OLEDTask",    4096, NULL, 1, &xOLEDTaskHandle,    0);
+}
+
+void loop() {
+  vTaskDelay(portMAX_DELAY);
+}
